@@ -11,9 +11,10 @@ details.
 
 ## To compile
 
-Checkout the repository, then 
-  cd apache2_mod_authz_dbd
-  apxs2  -i -a -c mod_authz_dbd.c -Wc,-Wall -Wc,-g, -Wc,-Wunused
+Checkout the repository, then
+ 
+    cd apache2_mod_authz_dbd
+    apxs2  -i -a -c mod_authz_dbd.c -Wc,-Wall -Wc,-g, -Wc,-Wunused
 
 This will compile the module and install it, thus replacing the one
 shippied in with apache. Restart apache to use it.
