@@ -109,7 +109,45 @@ static const command_rec authz_dbd_cmds[] = {
     {NULL}
 };
 
+static int evaluate_query_parameters(request_rec *r, 
+                                     const apr_array_header_t *parsed_require_args, 
+				     const void **query_parameters)
+{
+    int i;
+    apr_array_header_t *qp;
+    
+    const ap_expr_info_t *expr = NULL;
+    const char *parameter;
+    
+    const char *err = NULL;
+    
+    /* evaluate the query parameters in parsed_require_args */
+    qp = apr_array_make(r->pool, 
+			parsed_require_args->nelts, 
+			sizeof (char *));
+    
+    for (i = 0; i < parsed_require_args->nelts; i++) {
+        
+        expr = ((const ap_expr_info_t **)parsed_require_args->elts)[i];
+        parameter = ap_expr_str_exec(r, expr, &err);
+        
+        if (err) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                          "authz_dbd in evaluate query_parameters: Can't "
+                          "evaluate require expression: %s", err);
+            return HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        *(const char **)apr_array_push(qp) = parameter;
+    }
+    
+    *query_parameters = (void *)qp;
+    
+    return OK;
+}
+
 static int authz_dbd_login(request_rec *r, authz_dbd_cfg *cfg,
+			   const void *parsed_require_args,
                            const char *action)
 {
     int rv;
@@ -120,6 +158,7 @@ static int authz_dbd_login(request_rec *r, authz_dbd_cfg *cfg,
     apr_dbd_prepared_t *query;
     apr_dbd_results_t *res = NULL;
     apr_dbd_row_t *row = NULL;
+    apr_array_header_t *query_parameters;
 
     if (cfg->query == NULL) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01642)
@@ -140,8 +179,15 @@ static int authz_dbd_login(request_rec *r, authz_dbd_cfg *cfg,
         return HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    rv = apr_dbd_pvquery(dbd->driver, r->pool, dbd->handle, &nrows,
-                         query, r->user, NULL);
+    rv = evaluate_query_parameters(r, parsed_require_args, (void *)&query_parameters);
+    if (rv != OK) {
+        return HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    rv = apr_dbd_pquery(dbd->driver, r->pool, dbd->handle, &nrows,
+			query,
+			query_parameters->nelts,
+			(const char **)query_parameters->elts);
     if (rv == 0) {
         if (nrows != 1) {
             ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r, APLOGNO(01644)
@@ -181,9 +227,7 @@ static int authz_dbd_login(request_rec *r, authz_dbd_cfg *cfg,
                           action, r->user, message?message:noerror);
                 }
                 else if (newuri == NULL) {
-                    newuri =
-                        apr_pstrdup(r->pool,
-                                    apr_dbd_get_entry(dbd->driver, row, 0));
+                    newuri = apr_dbd_get_entry(dbd->driver, row, 0);
                 }
                 /* we can't break out here or row won't get cleaned up */
             }
@@ -200,6 +244,68 @@ static int authz_dbd_login(request_rec *r, authz_dbd_cfg *cfg,
         apr_table_set(r->err_headers_out, "Location", newuri);
     }
     authz_dbd_run_client_login(r, OK, action);
+    return OK;
+}
+
+static int authz_dbd_query(request_rec *r, authz_dbd_cfg *cfg,
+			   const apr_array_header_t *query_parameters,
+			   apr_array_header_t *query_result_rows)
+{
+    /* SELECT group FROM authz WHERE col = %s, col = %s, ... */
+    int rv;
+    const char *message;
+    ap_dbd_t *dbd = dbd_handle(r);
+    apr_dbd_prepared_t *query;
+    apr_dbd_results_t *res = NULL;
+    apr_dbd_row_t *row = NULL;
+    const char **query_result_row;
+
+    if (cfg->query == NULL) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                      "No query configured for dbd-query!");
+        return HTTP_INTERNAL_SERVER_ERROR;
+    }
+    if (dbd == NULL) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                      "No db handle available for dbd-query! Check your database access");
+        return HTTP_INTERNAL_SERVER_ERROR;
+    }
+    query = apr_hash_get(dbd->prepared, cfg->query, APR_HASH_KEY_STRING);
+    if (query == NULL) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                      "Error retrieving query for dbd-query!");
+        return HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    rv = apr_dbd_pselect(dbd->driver, r->pool, dbd->handle, &res,
+			 query, 0, 
+			 query_parameters->nelts,
+			 (const char **)query_parameters->elts);
+
+    if (rv == 0) {
+        for (rv = apr_dbd_get_row(dbd->driver, r->pool, res, &row, -1);
+             rv != -1;
+             rv = apr_dbd_get_row(dbd->driver, r->pool, res, &row, -1)) {
+            if (rv == 0) {
+                query_result_row = apr_array_push(query_result_rows);
+                *query_result_row = apr_dbd_get_entry(dbd->driver, row, 0);
+            }
+            else {
+                message = apr_dbd_error(dbd->driver, dbd->handle, rv);
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                              "authz_dbd dbd_query in get_row; query for user=%s [%s]",
+                              r->user, message?message:noerror);
+                return HTTP_INTERNAL_SERVER_ERROR;
+            }
+        }
+    }
+    else {
+        message = apr_dbd_error(dbd->driver, dbd->handle, rv);
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                      "authz_dbd, in dbd_query query for %s [%s]",
+                      r->user, message?message:noerror);
+        return HTTP_INTERNAL_SERVER_ERROR;
+    }
     return OK;
 }
 
@@ -261,6 +367,42 @@ static int authz_dbd_group_query(request_rec *r, authz_dbd_cfg *cfg,
     return OK;
 }
 
+static authz_status dbdquery_check_authorization(request_rec *r,
+                                                 const char *require_args,
+                                                 const void *parsed_require_args)
+{
+    int rv;
+
+    const apr_array_header_t *parsed_require_args_array = parsed_require_args;
+    apr_array_header_t *query_parameters;
+    apr_array_header_t *query_result_rows = NULL;
+
+    authz_dbd_cfg *cfg = ap_get_module_config(r->per_dir_config,
+                                              &authz_dbd_module);
+
+    if (!r->user) {
+        return AUTHZ_DENIED_NO_USER;
+    }
+    
+    rv = evaluate_query_parameters(r, parsed_require_args, (void *)&query_parameters);
+    if (rv != OK) {
+        return HTTP_INTERNAL_SERVER_ERROR;
+    }
+    
+    query_result_rows = apr_array_make(r->pool, 4, sizeof(const char*));
+    rv = authz_dbd_query(r, cfg, query_parameters, query_result_rows);
+    if (rv != OK) {
+        return HTTP_INTERNAL_SERVER_ERROR;
+    }
+    
+    /* if we get at least one row result, consider the request is granted */
+    if (query_result_rows->nelts) {
+        return AUTHZ_GRANTED;
+    }
+    
+    return AUTHZ_DENIED;
+}
+
 static authz_status dbdgroup_check_authorization(request_rec *r,
                                                  const char *require_args,
                                                  const void *parsed_require_args)
@@ -320,8 +462,8 @@ static authz_status dbdlogin_check_authorization(request_rec *r,
     if (!r->user) {
         return AUTHZ_DENIED_NO_USER;
     }
-
-    return (authz_dbd_login(r, cfg, "login") == OK ? AUTHZ_GRANTED : AUTHZ_DENIED);
+    
+    return (authz_dbd_login(r, cfg, parsed_require_args, "login") == OK ? AUTHZ_GRANTED : AUTHZ_DENIED);
 }
 
 static authz_status dbdlogout_check_authorization(request_rec *r,
@@ -335,11 +477,66 @@ static authz_status dbdlogout_check_authorization(request_rec *r,
         return AUTHZ_DENIED_NO_USER;
     }
 
-    return (authz_dbd_login(r, cfg, "logout") == OK ? AUTHZ_GRANTED : AUTHZ_DENIED);
+    return (authz_dbd_login(r, cfg, parsed_require_args, "logout") == OK ? AUTHZ_GRANTED : AUTHZ_DENIED);
 }
 
-static const char *dbd_parse_config(cmd_parms *cmd, const char *require_line,
-                                     const void **parsed_require_line)
+static const char *dbd_parse_config_query_parameters(cmd_parms *cmd, 
+						     const char *require_line,
+						     const void **parsed_require_line)
+{
+    const char *expr_err = NULL;
+    ap_expr_info_t *expr;
+    apr_array_header_t *expr_array = NULL;
+    
+    const char *t;
+    char *w;
+    
+    /* parse each element of the require line and store it in an
+       individual table entry. We will evaluate them in that order
+       when passing the parameters to the db query */
+    t = require_line;
+    while ((w = ap_getword_white(cmd->pool, &t)) && w[0]) {
+        
+        expr = ap_expr_parse_cmd(cmd, w, AP_EXPR_FLAG_STRING_RESULT,
+                                 &expr_err, NULL);
+        
+        if (expr_err)
+            return apr_pstrcat(cmd->temp_pool,
+                               "Cannot parse expression in require line: ",
+                               expr_err, NULL);
+        
+        if (expr_array == NULL) {
+            expr_array = apr_array_make(cmd->pool, 1, 
+                                        sizeof(const ap_expr_info_t *));
+        }
+        *(const ap_expr_info_t **)apr_array_push(expr_array) = expr;
+    }
+    
+    *parsed_require_line = expr_array;
+    
+    return NULL;
+}
+
+static const char *dbd_parse_config_session(cmd_parms *cmd, 
+					    const char *require_line,
+					    const void **parsed_require_line)
+{
+  const char *t;
+
+  /* to preserve backwards compatibility, if the require line has no
+     arguments, use REMOTE_USER by default. */
+  if (require_line[0] == '\0') {
+      t = apr_pstrdup (cmd->pool, "%{REMOTE_USER}");
+  }
+  else {
+      t = require_line;
+  }
+
+  return dbd_parse_config_query_parameters (cmd, t, parsed_require_line);
+}
+
+static const char *dbd_parse_config_groups(cmd_parms *cmd, const char *require_line,
+					   const void **parsed_require_line)
 {
     const char *expr_err = NULL;
     ap_expr_info_t *expr;
@@ -357,27 +554,37 @@ static const char *dbd_parse_config(cmd_parms *cmd, const char *require_line,
     return NULL;
 }
 
+static const authz_provider authz_dbdquery_provider =
+{
+    &dbdquery_check_authorization,
+    &dbd_parse_config_query_parameters,
+};
+
 static const authz_provider authz_dbdgroup_provider =
 {
     &dbdgroup_check_authorization,
-    &dbd_parse_config,
+    &dbd_parse_config_groups,
 };
 
 static const authz_provider authz_dbdlogin_provider =
 {
     &dbdlogin_check_authorization,
-    NULL,
+    dbd_parse_config_session,
 };
 
 
 static const authz_provider authz_dbdlogout_provider =
 {
     &dbdlogout_check_authorization,
-    NULL,
+    dbd_parse_config_session,
 };
 
 static void authz_dbd_hooks(apr_pool_t *p)
 {
+    ap_register_auth_provider(p, AUTHZ_PROVIDER_GROUP, "dbd-query",
+                              AUTHZ_PROVIDER_VERSION,
+                              &authz_dbdquery_provider,
+                              AP_AUTH_INTERNAL_PER_CONF);
     ap_register_auth_provider(p, AUTHZ_PROVIDER_GROUP, "dbd-group",
                               AUTHZ_PROVIDER_VERSION,
                               &authz_dbdgroup_provider,
