@@ -11,7 +11,7 @@ details.
 
 ## To compile
 
-Checkout the repository, then
+Clone the repository, then
  
     cd apache2_mod_authz_dbd
     apxs2  -i -a -c mod_authz_dbd.c -Wc,-Wall -Wc,-g, -Wc,-Wunused
